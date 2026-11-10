@@ -77,11 +77,16 @@ services:
 ```
 
 > [!IMPORTANT] 
-> The `EPOCH` environment variable must be consistent across all workers
+> The `EPOCH`, `MPID_BIT_SIZE`, and `DC_BIT_SIZE` environment variables must be consistent across all workers
+
+To allocate all 10 default machine-ID bits to workers (IDs `0` through `1023`), add `DC_BIT_SIZE=0` to each worker's
+environment. `DATA_CENTER_ID` is ignored in this mode. To change the total machine-ID allocation too, set `MPID_BIT_SIZE`
+from `0` through `21` and `DC_BIT_SIZE` from `0` through `floor(MPID_BIT_SIZE / 2)`. The default `DC_BIT_SIZE` stays `5`,
+so it must be lowered explicitly when `MPID_BIT_SIZE` is below `10`
 
 ## Recommended Resources
 
-Half a CPU and 64 MiB per worker, as in the examples above. Half a CPU is enough to reach the generator's cap of 4096 IDs per millisecond
+Half a CPU and 64 MiB per worker, as in the examples above. With the default bit allocation, half a CPU is enough to reach the generator's cap of 4096 IDs per millisecond
 with batch requests, so more CPU only speeds up single ID requests. Peak memory under load is about 12 MiB with the default `MAX_BATCH_SIZE`
 
 ### via k8s `resources`:
@@ -96,5 +101,6 @@ resources:
 ```
 
 > [!NOTE]
-> If you need more throughput, add workers with distinct `WORKER_ID`s rather than CPU, since each worker brings its own 4096 IDs per millisecond.
+> If you need more throughput, add workers with distinct `WORKER_ID`s rather than CPU, since each worker brings its own sequence capacity:
+> `2^(22 - MPID_BIT_SIZE)` IDs per millisecond (4096 by default, down to 2 with `MPID_BIT_SIZE=21`).
 > Raise the memory limit if you raise `MAX_BATCH_SIZE`

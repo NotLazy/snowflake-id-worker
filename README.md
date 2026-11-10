@@ -14,15 +14,24 @@ The worker supports the following environment variables:
 
 | Environment Variable | Default Value | Supported Type | Description |
 |--|--|--|--|
-| `WORKER_ID` | `0` | `0` to `31`, or "`FROM_HOSTNAME`" | An identifier for the given worker. Setting this value to "`FROM_HOSTNAME`" will try to parse the worker ID from the end of the hostname. This feature is for workers being run in k8s StatefulSets |
-| `DATA_CENTER_ID` | `0` | `0` to `31` | An identifier for the location that a given set of workers are running on |
+| `MPID_BIT_SIZE` | `10` | `0` to `21` | Total bits allocated to the worker and datacenter IDs. The remaining `22 - MPID_BIT_SIZE` bits hold the sequence |
+| `DC_BIT_SIZE` | `5` | `0` to `floor(MPID_BIT_SIZE / 2)` | Bits allocated to the datacenter ID; the worker ID gets `MPID_BIT_SIZE - DC_BIT_SIZE` bits. Set this explicitly when reducing `MPID_BIT_SIZE` below `10` |
+| `WORKER_ID` | `0` | `0` to `2^(MPID_BIT_SIZE - DC_BIT_SIZE) - 1`, or "`FROM_HOSTNAME`" | An identifier for the given worker (`0` to `31` by default). Setting this value to "`FROM_HOSTNAME`" will try to parse the worker ID from the end of the hostname. This feature is for workers being run in k8s StatefulSets |
+| `DATA_CENTER_ID` | `0` | `u64`; limited to `0` to `2^DC_BIT_SIZE - 1` when enabled | An identifier for the location that a given set of workers are running on (`0` to `31` by default). Ignored when `DC_BIT_SIZE=0`; otherwise, out-of-range values are rejected |
 | `EPOCH` | UNIX Epoch | `u64` | An optional environment variable that allows hosts to use a custom epoch. For example, Discord uses a custom epoch of `1420070400000`. Epochs in the future are rejected, and a more recent epoch leaves more of the 41-bit timestamp range available |
 | `PORT` | `8080` | `u16` | The port that the HTTP API listens to requests from. If you are using the snowflake-id-worker image, modifying this environment variable may also require adding a [Docker port forward](https://docs.docker.com/get-started/docker-concepts/running-containers/publishing-ports/) |
 | `MAX_BATCH_SIZE` | `100000` | `1` to `10000000` | The largest `count` accepted by `POST /generate`. Requests with a larger `count` will return a `400 Bad Request` |
 
 > [!IMPORTANT] 
 > To ensure the uniqueness of Snowflake IDs generated across a distributed system, all workers must have a unique combination
-> of `WORKER_ID` and `DATA_CENTER_ID`
+> of `WORKER_ID` and `DATA_CENTER_ID`. All workers must use the same `EPOCH`, `MPID_BIT_SIZE`, and `DC_BIT_SIZE`.
+> When `DC_BIT_SIZE=0`, only `WORKER_ID` distinguishes workers; `DATA_CENTER_ID` has no effect on generated IDs
+
+The timestamp always uses 41 bits. With the defaults, the layout remains 5 datacenter bits, 5 worker bits, and 12 sequence bits.
+For example, `MPID_BIT_SIZE=10 DC_BIT_SIZE=0` allows worker IDs `0` through `1023`, still with 4096 IDs per millisecond.
+At `MPID_BIT_SIZE=21 DC_BIT_SIZE=0`, worker IDs can reach `2097151`, but each worker can produce only 2 IDs per millisecond.
+At `MPID_BIT_SIZE=0 DC_BIT_SIZE=0`, only worker ID `0` is valid, with 4194304 IDs per millisecond.
+These settings are also available as `--mpid-bit-size` and `--dc-bit-size` command-line options
 
 # API Spec
 
@@ -58,7 +67,7 @@ If a `count` is **not** specified in the request body, one snowflake ID will be 
 </details>
 
 > [!NOTE]
-> A single worker generates at most 4096 snowflake IDs per millisecond. Requests beyond that queue up on the worker's generator thread, and once the queue
+> A single worker generates at most `2^(22 - MPID_BIT_SIZE)` snowflake IDs per millisecond (4096 by default). Requests beyond that queue up on the worker's generator thread, and once the queue
 > is full they receive a `429`. If the system clock steps backwards, the worker advances its logical time until wall time catches up
 
 ### **GET** `/generate`

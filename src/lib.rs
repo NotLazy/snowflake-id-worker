@@ -19,9 +19,6 @@ use warp::hyper::body::Bytes;
 use warp::reply::Response;
 use warp::{Filter, Reply};
 
-const MAX_DATA_CENTER_ID: u8 = (1 << 5) - 1;
-const MAX_WORKER_ID: u8 = (1 << 5) - 1;
-
 const DEFAULT_EPOCH_MILLIS: i64 = 0;
 
 /// default per-request generation cap
@@ -53,7 +50,18 @@ struct Args {
     worker_id: String,
 
     #[arg(long, default_value = "0", env = "DATA_CENTER_ID")]
-    data_center_id: u8,
+    data_center_id: u64,
+
+    #[arg(
+        long,
+        default_value = "10",
+        env = "MPID_BIT_SIZE",
+        value_parser = clap::value_parser!(u8).range(0..=21)
+    )]
+    mpid_bit_size: u8,
+
+    #[arg(long, default_value = "5", env = "DC_BIT_SIZE")]
+    dc_bit_size: u8,
 
     #[arg(long, env = "EPOCH")]
     epoch: Option<u64>,
@@ -324,26 +332,18 @@ fn snowflake_generator(args: Args) -> SnowflakeGenerator<SystemClock> {
                 "cannot split WORKER_ID from hostname (WORKER_ID is being parsed from hostname)",
             )
             .1
-            .parse::<u8>()
+            .parse::<u32>()
             .expect(
                 "cannot parse WORKER_ID from hostname (WORKER_ID is being parsed from hostname)",
             )
     } else {
-        args.worker_id.parse::<u8>().unwrap_or_else(|_| {
+        args.worker_id.parse::<u32>().unwrap_or_else(|_| {
             panic!(
-                "cannot parse WORKER_ID as a valid u8 (WORKER_ID: \"{}\")",
+                "cannot parse WORKER_ID as a valid u32 (WORKER_ID: \"{}\")",
                 args.worker_id
             )
         })
     };
-
-    if args.data_center_id > MAX_DATA_CENTER_ID {
-        panic!("DATA_CENTER_ID must be at most {MAX_DATA_CENTER_ID}");
-    }
-
-    if worker_id > MAX_WORKER_ID {
-        panic!("WORKER_ID must be at most {MAX_WORKER_ID}");
-    }
 
     let clock = SystemClock;
     let now_millis = clock.now_unix_millis();
@@ -359,9 +359,16 @@ fn snowflake_generator(args: Args) -> SnowflakeGenerator<SystemClock> {
         );
     }
 
-    println!("starting snowflake-id-worker with WORKER_ID: {worker_id}, DATA_CENTER_ID: {}, and EPOCH: {epoch_millis}", args.data_center_id);
-
-    SnowflakeGenerator::new(args.data_center_id, worker_id, epoch_millis, clock)
+    let generator = SnowflakeGenerator::new(
+        args.data_center_id,
+        worker_id,
+        epoch_millis,
+        clock,
+        args.mpid_bit_size,
+        args.dc_bit_size,
+    );
+    println!("starting snowflake-id-worker with WORKER_ID: {worker_id}, DATA_CENTER_ID: {}, MPID_BIT_SIZE: {}, DC_BIT_SIZE: {}, and EPOCH: {epoch_millis}", args.data_center_id, args.mpid_bit_size, args.dc_bit_size);
+    generator
 }
 
 struct SystemClock;
@@ -384,6 +391,59 @@ mod tests {
     use std::env;
 
     use warp::test::request;
+
+    #[test]
+    #[serial]
+    fn test_env_parsing_configurable_machine_bits_and_large_hostname_ids() {
+        clear_env();
+        for (mpid_bits, dc_bits, worker, dc, hostname, expected_machine) in [
+            ("10", "0", "1023", "18446744073709551615", "", 1023),
+            ("21", "10", "2047", "1023", "", 2_097_151),
+            (
+                "21",
+                "0",
+                "FROM_HOSTNAME",
+                "9999",
+                "worker-2097151",
+                2_097_151,
+            ),
+            ("0", "0", "0", "9999", "", 0),
+        ] {
+            env::set_var("MPID_BIT_SIZE", mpid_bits);
+            env::set_var("DC_BIT_SIZE", dc_bits);
+            env::set_var("WORKER_ID", worker);
+            env::set_var("DATA_CENTER_ID", dc);
+            env::set_var("HOSTNAME_FOR_TESTING", hostname);
+
+            let id = snowflake_generator_from_env().generate();
+            let sequence_bits = 22 - mpid_bits.parse::<u8>().unwrap();
+            assert_eq!((id & ((1 << 22) - 1)) >> sequence_bits, expected_machine);
+        }
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cli_parsing_machine_bit_sizes() {
+        clear_env();
+        let args = Args::try_parse_from([
+            "worker",
+            "--mpid-bit-size",
+            "21",
+            "--dc-bit-size",
+            "0",
+            "--worker-id",
+            "2097151",
+            "--data-center-id",
+            "9999",
+        ])
+        .unwrap();
+        assert!(snowflake_generator(args).generate() > 0);
+
+        for value in ["-1", "22", "256"] {
+            assert!(Args::try_parse_from(["worker", "--mpid-bit-size", value]).is_err());
+        }
+    }
 
     #[test]
     #[serial]
@@ -446,8 +506,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_env_parsing_max_values() {
-        env::set_var("WORKER_ID", MAX_WORKER_ID.to_string());
-        env::set_var("DATA_CENTER_ID", MAX_DATA_CENTER_ID.to_string());
+        env::set_var("WORKER_ID", "31");
+        env::set_var("DATA_CENTER_ID", "31");
         env::remove_var("EPOCH");
 
         let generator = snowflake_generator_from_env();
@@ -523,7 +583,7 @@ mod tests {
 
     #[test]
     #[serial]
-    #[should_panic(expected = "cannot parse WORKER_ID as a valid u8")]
+    #[should_panic(expected = "cannot parse WORKER_ID as a valid u32")]
     fn test_env_parsing_invalid_worker_id() {
         env::set_var("WORKER_ID", "invalid");
         env::set_var("DATA_CENTER_ID", "0");
@@ -825,6 +885,8 @@ mod tests {
         env::remove_var("EPOCH");
         env::remove_var("HOSTNAME_FOR_TESTING");
         env::remove_var("MAX_BATCH_SIZE");
+        env::remove_var("MPID_BIT_SIZE");
+        env::remove_var("DC_BIT_SIZE");
     }
 
     #[tokio::test]
